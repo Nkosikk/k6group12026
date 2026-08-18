@@ -1,0 +1,231 @@
+name: k6 Performance Test Suite
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:  # Allows manual triggering
+    inputs:
+      vus:
+        description: 'Number of virtual users'
+        required: false
+        default: '20'
+      duration:
+        description: 'Test duration (e.g., 30s, 1m)'
+        required: false
+        default: '30s'
+
+permissions:
+  contents: read
+  pull-requests: write  # For commenting results on PRs
+
+jobs:
+  # Single-user baseline test
+  baseline-test:
+    name: 🔍 Baseline Test (1 VU)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install k6
+      run: |
+        sudo gpg -k
+        sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+    
+    - name: Run baseline test
+      run: |
+        mkdir -p reports
+        k6 run tests/loginTest.js --vus 1 --duration 10s --summary-export=reports/baseline-report.json
+      continue-on-error: false
+    
+    - name: Upload baseline report
+      uses: actions/upload-artifact@v4
+      with:
+        name: baseline-test-report
+        path: reports/baseline-report.json
+
+  # Staged load tests (increasing users)
+  load-tests:
+    name: 📊 Load Test (${{ matrix.vus }} VUs)
+    runs-on: ubuntu-latest
+    needs: baseline-test
+    strategy:
+      fail-fast: false  # Continue even if one test fails
+      matrix:
+        vus: [5, 10, 15, 20, 50]
+        test-file:
+          - loginTest.js
+          - profileTest.js
+        # Exclude some combinations to save time (optional)
+        exclude:
+          - vus: 50
+            test-file: profileTest.js
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install k6
+      run: |
+        sudo gpg -k
+        sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+    
+    - name: Run load test
+      run: |
+        mkdir -p reports
+        echo "Running ${{ matrix.test-file }} with ${{ matrix.vus }} virtual users..."
+        k6 run tests/${{ matrix.test-file }} \
+          --vus ${{ matrix.vus }} \
+          --duration 30s \
+          --summary-export=reports/${{ matrix.test-file }}-${{ matrix.vus }}vus-report.json \
+          --thresholds "http_req_duration<2000,http_req_failed<0.01"
+      continue-on-error: true
+    
+    - name: Upload test report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: report-${{ matrix.test-file }}-${{ matrix.vus }}vus
+        path: reports/${{ matrix.test-file }}-${{ matrix.vus }}vus-report.json
+
+  # Full test suite with all test files
+  full-suite:
+    name: 🚀 Full Test Suite (All Operations)
+    runs-on: ubuntu-latest
+    needs: baseline-test
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install k6
+      run: |
+        sudo gpg -k
+        sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+    
+    - name: Run all test files
+      run: |
+        mkdir -p reports
+        # Get VUs from workflow input or use default
+        VUS=${{ github.event.inputs.vus || 20 }}
+        DURATION=${{ github.event.inputs.duration || '30s' }}
+        
+        for test in tests/*.js; do
+          test_name=$(basename "$test" .js)
+          echo "========================================="
+          echo "Running: $test_name with ${VUS} VUs"
+          echo "========================================="
+          k6 run "$test" \
+            --vus $VUS \
+            --duration $DURATION \
+            --summary-export="reports/${test_name}-report.json" \
+            --thresholds "http_req_duration<2000,http_req_failed<0.01" \
+            || true  # Continue even if one test fails
+        done
+      continue-on-error: true
+    
+    - name: Upload all reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: full-suite-reports
+        path: reports/*.json
+
+  # Generate summary report
+  summary:
+    name: 📊 Test Summary
+    runs-on: ubuntu-latest
+    needs: [baseline-test, load-tests, full-suite]
+    if: always()
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download all reports
+      uses: actions/download-artifact@v4
+      with:
+        path: all-reports
+      continue-on-error: true
+    
+    - name: Generate summary
+      run: |
+        echo "## 📊 k6 Test Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Test | VUs | Avg Response | 95th % | Error Rate | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|-----|--------------|--------|------------|--------|" >> $GITHUB_STEP_SUMMARY
+        
+        # Process all JSON reports
+        find all-reports -name "*.json" -type f | while read -r file; do
+          if [ -f "$file" ] && [ -s "$file" ]; then
+            test_name=$(basename "$file" .json | sed 's/-report//')
+            vus=$(echo "$test_name" | grep -o '[0-9]*vus' | sed 's/vus//' || echo "N/A")
+            
+            # Extract metrics using jq if available, or grep
+            if command -v jq &> /dev/null; then
+              avg=$(jq -r '.metrics.http_req_duration.avg // "N/A"' "$file" 2>/dev/null)
+              p95=$(jq -r '.metrics.http_req_duration."p(95)" // "N/A"' "$file" 2>/dev/null)
+              error=$(jq -r '.metrics.http_req_failed.value * 100 // "N/A"' "$file" 2>/dev/null)
+              
+              if [ "$avg" != "N/A" ] && [ "$avg" != "null" ]; then
+                avg="${avg}ms"
+                p95="${p95}ms"
+                error="${error}%"
+                status="✅"
+                [ "$(echo "$error < 1" | bc -l 2>/dev/null)" = "0" ] && status="⚠️"
+                [ "$(echo "$p95 > 2000" | bc -l 2>/dev/null)" = "1" ] && status="❌"
+                echo "| ${test_name} | ${vus} | ${avg} | ${p95} | ${error} | ${status} |" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          fi
+        done
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📎 **Full reports available in artifacts**" >> $GITHUB_STEP_SUMMARY
+      
+    - name: Comment on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          let comment = '## 🏃 k6 Performance Test Results\n\n';
+          
+          // Find and read summary
+          const summaryFile = 'all-reports/baseline-test-report/baseline-report.json';
+          if (fs.existsSync(summaryFile)) {
+            const data = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
+            const avg = data.metrics?.http_req_duration?.avg?.toFixed(2) || 'N/A';
+            const p95 = data.metrics?.http_req_duration?.['p(95)']?.toFixed(2) || 'N/A';
+            const error = data.metrics?.http_req_failed?.value !== undefined 
+              ? (data.metrics.http_req_failed.value * 100).toFixed(2) 
+              : 'N/A';
+            
+            comment += '### Baseline (1 VU)\n';
+            comment += `- **Avg Response**: ${avg}ms\n`;
+            comment += `- **95th Percentile**: ${p95}ms\n`;
+            comment += `- **Error Rate**: ${error}%\n\n`;
+          }
+          
+          comment += '📎 **Full test reports available in the workflow artifacts.**';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
